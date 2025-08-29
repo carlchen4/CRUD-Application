@@ -1,78 +1,146 @@
-# Import necessary libraries from Flask
 from flask import Flask, redirect, request, render_template, url_for
+import json
+import os
+import threading
+from pathlib import Path
 
-# Instantiate Flask application
 app = Flask(__name__)
 
-# Sample data representing transactions
-transactions = [
+# --- Paths (robust when using `flask run`) ---
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_FILE = DATA_DIR / "transactions.json"
+
+# --- Concurrency guard (per-process) ---
+_file_lock = threading.Lock()
+
+# --- Defaults ---
+DEFAULT_TRANSACTIONS = [
     {'id': 1, 'date': '2023-06-01', 'amount': 100},
     {'id': 2, 'date': '2023-06-02', 'amount': -200},
-    {'id': 3, 'date': '2023-06-03', 'amount': 300}
+    {'id': 3, 'date': '2023-06-03', 'amount': 300},
 ]
 
-# Read operation: Route to list all transactions
+def _normalize_record(item, fallback_id):
+    """
+    Ensure each record has correct keys/types.
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        id_ = int(item.get('id', fallback_id))
+        date = str(item.get('date', ''))
+        amount = float(item.get('amount', 0))
+        return {'id': id_, 'date': date, 'amount': amount}
+    except (TypeError, ValueError):
+        return None
+
+def load_transactions():
+    """
+    Robust loader:
+    - Uses script-relative path (works with `flask run`)
+    - Handles missing/empty/corrupted JSON
+    - Validates structure and normalizes records
+    """
+    with _file_lock:
+        if not DATA_FILE.exists() or DATA_FILE.stat().st_size == 0:
+            # First run: create file with defaults for convenience
+            _atomic_save(DEFAULT_TRANSACTIONS)
+            return DEFAULT_TRANSACTIONS.copy()
+
+        try:
+            with DATA_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError:
+            # Corrupted file → fall back and rewrite a clean file
+            _atomic_save(DEFAULT_TRANSACTIONS)
+            return DEFAULT_TRANSACTIONS.copy()
+
+        if not isinstance(data, list):
+            # Unexpected structure → reset to defaults
+            _atomic_save(DEFAULT_TRANSACTIONS)
+            return DEFAULT_TRANSACTIONS.copy()
+
+        cleaned = []
+        for i, item in enumerate(data, start=1):
+            norm = _normalize_record(item, fallback_id=i)
+            if norm is not None:
+                cleaned.append(norm)
+
+        # If file had junk and we cleaned it, write back the sanitized version
+        if cleaned != data:
+            _atomic_save(cleaned)
+
+        return cleaned
+
+def _atomic_save(data):
+    """
+    Atomic write to avoid partial/corrupt files.
+    """
+    tmp = DATA_FILE.with_suffix(DATA_FILE.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, DATA_FILE)  # atomic on POSIX & modern Windows
+
+def save_transactions():
+    with _file_lock:
+        _atomic_save(transactions)
+
+def next_id():
+    return (max((int(t.get('id', 0)) for t in transactions), default=0) + 1)
+
+# Load on startup
+transactions = load_transactions()
+
+# ---------------- CRUD ROUTES ---------------- #
+
 @app.route("/")
 def get_transactions():
-    # Render the transactions list template and pass the transactions data
     return render_template("transactions.html", transactions=transactions)
 
-# Create operation: Route to display and process add transaction form
 @app.route("/add", methods=["GET", "POST"])
 def add_transaction():
     if request.method == 'POST':
-        # Extract form data to create a new transaction object
         transaction = {
-            'id': len(transactions) + 1,         # Generate a new ID based on the current length of the transactions list
-            'date': request.form['date'],        # Get the 'date' field value from the form
-            'amount': float(request.form['amount']) # Get the 'amount' field value from the form and convert it to a float
+            'id': next_id(),
+            'date': request.form['date'],
+            'amount': float(request.form['amount']),
         }
-
-        # Append the new transaction to the transactions list
         transactions.append(transaction)
-
-        # Redirect to the transactions list page after adding the new transaction
+        save_transactions()
         return redirect(url_for("get_transactions"))
-
-    # Render the form template to display the add transaction form if the request method is GET
     return render_template("form.html")
 
-# Update operation: Route to display and process edit transaction form
 @app.route("/edit/<int:transaction_id>", methods=["GET", "POST"])
 def edit_transaction(transaction_id):
     if request.method == 'POST':
-        # Extract the updated values from the form fields
         date = request.form['date']
         amount = float(request.form['amount'])
-
-        # Find the transaction with the matching ID and update its values
-        for transaction in transactions:
-            if transaction['id'] == transaction_id:
-                transaction['date'] = date       # Update the 'date' field of the transaction
-                transaction['amount'] = amount   # Update the 'amount' field of the transaction
-                break                            # Exit the loop once the transaction is found and updated
-
-        # Redirect to the transactions list page after updating the transaction
+        for t in transactions:
+            if t['id'] == transaction_id:
+                t['date'] = date
+                t['amount'] = amount
+                save_transactions()
+                break
         return redirect(url_for("get_transactions"))
 
-    # Find the transaction with the matching ID and render the edit form if the request method is GET
-    for transaction in transactions:
-        if transaction['id'] == transaction_id:
-            # Render the edit form template and pass the transaction to be edited
-            return render_template("edit.html", transaction=transaction)
+    for t in transactions:
+        if t['id'] == transaction_id:
+            return render_template("edit.html", transaction=t)
+    return {"message": "Transaction not found"}, 404
 
-# Delete operation: Route to delete a transaction
 @app.route("/delete/<int:transaction_id>")
 def delete_transaction(transaction_id):
-    # Find the transaction with the matching ID and remove it from the list
-    for transaction in transactions:
-        if transaction['id'] == transaction_id:
-            transactions.remove(transaction)  # Remove the transaction from the transactions list
-            break                            # Exit the loop once the transaction is found and removed
-
-    # Redirect to the transactions list page after deleting the transaction
+    # mutate in place to avoid losing references
+    idx = next((i for i, t in enumerate(transactions) if t['id'] == transaction_id), None)
+    if idx is not None:
+        transactions.pop(idx)
+        save_transactions()
     return redirect(url_for("get_transactions"))
 
-# Run the Flask application
+# ---------------- MAIN ---------------- #
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, host="0.0.0.0", port=8181)
